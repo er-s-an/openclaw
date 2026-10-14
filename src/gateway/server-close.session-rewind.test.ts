@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import type { SessionsRewindResult } from "../../packages/gateway-protocol/src/index.js";
+import type {
+  SessionsForkResult,
+  SessionsRewindResult,
+} from "../../packages/gateway-protocol/src/index.js";
 import {
   awaitGateBeforeSettlement,
   createDeferred,
   withinTest,
 } from "../../test/helpers/promise.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.sqlite-entry.js";
-import { replaceTranscriptEventsSync } from "../config/sessions/session-accessor.sqlite-transcript-write.js";
+import { replaceTranscriptEventsSync } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import { waitForSessionTranscriptIndexReconcile } from "../config/sessions/session-transcript-reconcile.js";
 import { createSessionTranscriptHeader } from "../config/sessions/transcript-header.js";
+import * as lifecycleAdmission from "../sessions/session-lifecycle-admission.js";
 import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import * as agentExecution from "../state/openclaw-agent-execution.js";
 import { createGatewayMetadataCloseFixture } from "./server-close.metadata.test-support.js";
@@ -75,7 +79,7 @@ afterAll(async () => {
   await fixture?.cleanup();
 });
 
-it("persists an accepted rewind across the close prelude before retiring its database", async ({
+it("persists an accepted fork and queued rewind across the close prelude before retiring their database", async ({
   signal,
 }) => {
   assert(prepared && fixture, "Seeded Gateway close fixture");
@@ -83,37 +87,46 @@ it("persists an accepted rewind across the close prelude before retiring its dat
   const accepted = createDeferred();
   const releasePersistence = createDeferred();
   const preludeEntered = createDeferred();
+  const rewindQueued = createDeferred();
+  let forking: Promise<SessionsForkResult> | undefined;
   let rewinding: Promise<SessionsRewindResult> | undefined;
   let closing: Promise<void> | undefined;
   try {
-    const capture = agentExecution.captureOpenClawAgentDatabaseExecution;
     let executions = 0;
-    vi.spyOn(agentExecution, "captureOpenClawAgentDatabaseExecution").mockImplementation(
-      (...args): ReturnType<typeof capture> => {
-        const owner = capture(...args);
-        return {
-          ...owner,
-          get fileIdentity() {
-            return owner.fileIdentity;
-          },
-          runExisting: (source, operation, options) =>
-            owner.runExisting(
-              source,
-              (worker) =>
-                operation({
-                  execute: async (command, commandOptions) => {
-                    if (command.type === "session.messageCut.commit") {
-                      executions++;
-                      accepted.resolve();
-                      await releasePersistence.promise;
-                    }
-                    return await worker.execute(command, commandOptions);
-                  },
-                }),
-              options,
-            ),
-        };
+    const wrapExecution = (
+      owner: ReturnType<typeof agentExecution.captureOpenClawAgentDatabaseExecution>,
+    ): ReturnType<typeof agentExecution.captureOpenClawAgentDatabaseExecution> => ({
+      ...owner,
+      get fileIdentity() {
+        return owner.fileIdentity;
       },
+      runExisting: (source, operation, options) =>
+        owner.runExisting(
+          source,
+          (worker) =>
+            operation({
+              execute: async (command, commandOptions) => {
+                if (
+                  command.type === "session.messageCut.commit" ||
+                  command.type === "database.domain.publish"
+                ) {
+                  executions++;
+                  accepted.resolve();
+                  await releasePersistence.promise;
+                }
+                return await worker.execute(command, commandOptions);
+              },
+            }),
+          options,
+        ),
+    });
+    const capture = agentExecution.captureOpenClawAgentDatabaseExecution;
+    vi.spyOn(agentExecution, "captureOpenClawAgentDatabaseExecution").mockImplementation(
+      (...args) => wrapExecution(capture(...args)),
+    );
+    const capturePreparation = agentExecution.captureOpenClawAgentDatabasePreparationExecution;
+    vi.spyOn(agentExecution, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
+      (...args) => wrapExecution(capturePreparation(...args)),
     );
     const dispatchOptions = {
       client: createSyntheticPluginRuntimeClient({ scopes: ["operator.admin"] }),
@@ -121,6 +134,30 @@ it("persists an accepted rewind across the close prelude before retiring its dat
       methodRegistry: kernel.getAttachedGatewayMethodRegistry(),
     };
     const params = { sessionKey: scope.sessionKey, entryId: "user-2" };
+    forking = dispatchGatewayRequestInProcess<SessionsForkResult>(
+      "sessions.fork",
+      params,
+      dispatchOptions,
+    );
+    await withinTest(
+      awaitGateBeforeSettlement(
+        accepted.promise,
+        forking,
+        "Fork settled before its accepted persistence could be held",
+      ),
+      signal,
+    );
+    const mutate = lifecycleAdmission.runExclusiveSessionLifecycleMutation;
+    vi.spyOn(lifecycleAdmission, "runExclusiveSessionLifecycleMutation").mockImplementation(
+      <T>(...args: Parameters<typeof mutate<T>>): Promise<T> => {
+        const [operation, options] = args;
+        const pending = mutate(operation, options);
+        if (operation === "rewind") {
+          rewindQueued.resolve();
+        }
+        return pending;
+      },
+    );
     rewinding = dispatchGatewayRequestInProcess<SessionsRewindResult>(
       "sessions.rewind",
       params,
@@ -128,9 +165,9 @@ it("persists an accepted rewind across the close prelude before retiring its dat
     );
     await withinTest(
       awaitGateBeforeSettlement(
-        accepted.promise,
+        rewindQueued.promise,
         rewinding,
-        "Rewind settled before its accepted persistence could be held",
+        "Rewind settled before entering the lifecycle queue",
       ),
       signal,
     );
@@ -157,9 +194,13 @@ it("persists an accepted rewind across the close prelude before retiring its dat
     ).rejects.toThrow("Gateway request entry is closed");
 
     releasePersistence.resolve();
-    const [result] = await withinTest(Promise.all([rewinding, closing]), signal);
+    const [fork, result] = await withinTest(Promise.all([forking, rewinding, closing]), signal);
+    expect(fork).toMatchObject({
+      editorText: "Edit this question.",
+      sessionKey: expect.any(String),
+    });
     expect(result).toEqual({ editorText: "Edit this question." });
-    expect(executions).toBe(1);
+    expect(executions).toBe(2);
     expect(database.db.isOpen).toBe(false);
     const reopened = new DatabaseSync(database.path, { readOnly: true });
     try {
@@ -168,6 +209,19 @@ it("persists an accepted rewind across the close prelude before retiring its dat
           "SELECT current_session_id AS session_id, json_extract(entry_json, '$.previousSessionId') AS previous_session_id FROM session_nodes WHERE session_key = ?",
         )
         .get(scope.sessionKey);
+      const child = reopened
+        .prepare("SELECT current_session_id AS session_id FROM session_nodes WHERE session_key = ?")
+        .get(fork.sessionKey);
+      assert(typeof child?.session_id === "string");
+      expect(child.session_id).not.toBe(scope.sessionId);
+      expect(child.session_id).not.toBe(row?.session_id);
+      expect(
+        reopened
+          .prepare(
+            "SELECT identity.event_id FROM session_transcript_active_events active JOIN transcript_event_identities identity ON identity.session_id = active.session_id AND identity.seq = active.event_seq WHERE active.session_id = ? AND active.message_position IS NOT NULL ORDER BY active.message_position",
+          )
+          .all(child.session_id),
+      ).toEqual([{ event_id: "user-1" }, { event_id: "assistant-1" }]);
       assert(typeof row?.session_id === "string");
       expect(row.session_id).not.toBe(scope.sessionId);
       expect(row.previous_session_id).toBe(scope.sessionId);
@@ -183,7 +237,7 @@ it("persists an accepted rewind across the close prelude before retiring its dat
     }
   } finally {
     releasePersistence.resolve();
-    await Promise.allSettled([rewinding, closing]);
+    await Promise.allSettled([forking, rewinding, closing]);
     vi.restoreAllMocks();
     await fixture.cleanup();
     fixture = undefined;
